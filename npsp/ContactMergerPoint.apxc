@@ -1,0 +1,75 @@
+@RestResource(urlMapping='/mergeContacts/*')
+global class ContactMergerPoint {
+ @HttpPost
+    global static MyMergeResponse[] mergeContacts(MyMergeRequest[] request) { 
+        ID masterId = request[0].masterRecord.Id;
+        ID[] ids = request[0].recordToMergeIds;
+        Contact master = null;
+        List<Contact> duplicates =  new List<Contact>();
+        MyMergeResponse[] rsp = new MyMergeResponse[0];
+
+        try{
+            master = [SELECT Id, Name FROM Contact WHERE Id=:masterId] ;
+            duplicates = [SELECT Id, Name FROM Contact WHERE Id in :ids];
+        } catch (Exception e){
+            MyError err = new MyError();
+            err.statusCode = '500';
+            err.message = e.getMessage();
+            MyMergeResponse r = new MyMergeResponse();
+            r.errors = new MyError[]{err};
+            r.success = false;
+            r.id = masterId;
+            rsp[0] = r;
+        }
+
+        if (duplicates.size() >0 && master != null){
+            DG_Contact_Merger_NPSP m = new DG_Contact_Merger_NPSP();
+            List<Database.MergeResult> result = m.mergeContacts(master, duplicates);
+            rsp = new MyMergeResponse[result.size()];
+            Integer index = 0;
+            for (Database.MergeResult r : result){
+                MyMergeResponse resp = new MyMergeResponse(r);
+                rsp[index] = resp;                
+                index++;
+            }
+        }
+
+        return rsp;
+    }
+    
+    global class MyMergeRequest{ 
+        public SObject masterRecord {get; set;} 
+        public ID[] recordToMergeIds {get; set;} 
+        public Map<String,String> AdditionalInformationMap {get;set;}
+    } 
+    
+    global class MyError { 
+        public String statusCode {get; set;} 
+        public String message {get; set;} 
+        public String[] fields{get; set;} 
+    } 
+    
+    global class MyMergeResponse{ 
+        public MyError[] errors {get; set;} 
+        public ID id {get; set;} 
+        public ID[] mergedRecordIds {get; set;} 
+        public Boolean success {get; set;} 
+        public ID[] updatedRelatedIds {get; set;} 
+
+        public MyMergeResponse(){
+
+        }
+
+        public MyMergeResponse(Database.MergeResult result){
+           MyError e = new MyError();
+           if (result.errors != null && result.errors.size() > 0){
+               e.message = result.errors[0].message;
+           }
+           this.errors  = new MyError[]{e};
+           this.id = result.id ;
+           this.mergedRecordIds = result.mergedRecordIds;
+           this.success  = result.success;
+           this.updatedRelatedIds = result.updatedRelatedIds;
+        }  
+    } 
+}

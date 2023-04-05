@@ -1,0 +1,438 @@
+// https://help.salesforce.com/s/articleView?id=000381971&type=1
+
+global class DG_Contact_Merger_NPSP {
+
+    public final Integer MERGE_MINIMUM = 2;
+    public final Integer MERGE_LIMIT = 3;
+    
+    final String ONE_TO_ONE_ORGANIZATION_TYPE = 'One-to-One Individual';
+    final String HH_ACCOUNT_TYPE = 'Household Account';
+    final String INSUFFICIENT_PERMISSION_MESSAGE = 'You do not have permissions to modify';
+    private final String SUSTAINER_FIELD = 'npsp__Sustainer__c';
+    final String conMergeErrNoPersonAccounts = 'Person accounts are not supported.';
+
+    public final static String STATUS_ACTIVE = 'Active';
+    public final static String STATUS_LAPSED = 'Lapsed';
+    public final static String STATUS_CLOSED = 'Closed';
+    public final static String STATUS_PAUSED = 'Paused';
+    public final static String STATUS_FAILING = 'Failing';
+
+    List<SObject> recordsToUpdate = new List<SObject>();
+
+    public enum SustainerType {
+        Active,
+        Lapsed,
+        Former
+    }
+
+    public enum Allowed {
+        canRead,
+        canUpdate
+    }
+
+    public static final Map<String, String> READ_ONLY_STATUS_TO_STATE = new Map<String, String> {
+        DG_Contact_Merger_NPSP.STATUS_ACTIVE => DG_Contact_Merger_NPSP.STATUS_ACTIVE,
+        DG_Contact_Merger_NPSP.STATUS_LAPSED => DG_Contact_Merger_NPSP.STATUS_LAPSED,
+        DG_Contact_Merger_NPSP.STATUS_CLOSED => DG_Contact_Merger_NPSP.STATUS_CLOSED,
+        DG_Contact_Merger_NPSP.STATUS_PAUSED => DG_Contact_Merger_NPSP.STATUS_ACTIVE,
+        DG_Contact_Merger_NPSP.STATUS_FAILING => DG_Contact_Merger_NPSP.STATUS_ACTIVE
+    };
+
+    List<String> contactFields = new List<String>{
+            'Id', 'npe01__Private__c', 'AccountId', 'Account.npe01__SYSTEMIsIndividual__c',
+            'Account.npe01__SYSTEM_AccountType__c', 'Account.npe01__One2OneContact__c',
+            'npe01__Organization_Type__c', 'Account.Name',
+            'FirstName', 'LastName', 'OwnerId', 'Salutation', 'npo02__Naming_Exclusions__c',
+            'npo02__Household_Naming_Order__c',
+            'MailingStreet', 'MailingCity', 'MailingState', 'MailingPostalCode',
+            'MailingCountry', 'MailingLatitude', 'MailingLongitude',
+            'OtherStreet', 'OtherCity', 'OtherState', 'OtherPostalCode',
+            'OtherCountry', 'OtherLatitude', 'OtherLongitude',
+            'Phone', 'Fax'
+    };
+
+    List<String> accountFields = new List<String> {
+        String.valueOf(Account.Name),
+        String.valueOf(Account.npe01__SYSTEM_AccountType__c)
+    };
+
+    private Map<String, String> statusLabelByValue {
+        get {
+            if (statusLabelByValue == null) {
+                statusLabelByValue = this.getActiveStatusPicklistValues();
+            }
+            return statusLabelByValue;
+        }
+        set;
+    }
+
+    private Map<String, Mapping> mappingByStatus {
+        get {
+            if (mappingByStatus == null) {
+                mappingByStatus = this.getMapping();
+            }
+            return mappingByStatus;
+        }
+        set;
+    }
+
+    private Map<String, String> getActiveStatusPicklistValues() {
+        Map<String, String> labelByValue = new Map<String, String>();
+        List<Schema.PicklistEntry> statusEntries = npe03__Recurring_Donation__c.npsp__Status__c.getDescribe().getPicklistValues();
+
+        for (Schema.PicklistEntry entry : statusEntries) {
+            if (entry.isActive()) {
+                labelByValue.put(entry.getValue(), entry.getLabel());
+            }
+        }
+
+        return labelByValue;
+    }
+
+    public Set<String> getStatusValues(String requestedStatus) {
+        List<Mapping> allmappings = mappingByStatus.values();
+        Set<String> activeStates = new Set<String>();
+
+        for (Mapping mapping : allmappings) {
+            if (mapping.state == requestedStatus) {
+                activeStates.add(mapping.status);
+            }
+        }
+
+        return activeStates;
+    }
+
+    private Map<String, Mapping> getMapping() {
+        Map<String, Mapping> mappingByStatus = new Map<String, Mapping>();
+
+        for (String status : statusLabelByValue.keySet()) {
+            mappingByStatus.put(
+                status,
+                new Mapping(status, statusLabelByValue.get(status))
+            );
+        }
+        List<npsp__RecurringDonationStatusMapping__mdt> records = [
+            SELECT
+                MasterLabel,
+                DeveloperName,
+                npsp__Status__c,
+                npsp__State__c
+            FROM npsp__RecurringDonationStatusMapping__mdt
+        ];
+
+        for (npsp__RecurringDonationStatusMapping__mdt record : records) {
+            Mapping mapping = mappingByStatus.get(record.npsp__Status__c);
+            if (mapping != null) {
+                mapping.withMappingRecord(record);
+            }
+        }
+
+        return mappingByStatus;
+    }
+
+    private  List<Account> getHouseholdAndOrgAccountsFor(Set<Id> accountIds) {
+        return [
+                SELECT Id, npe01__SYSTEMIsIndividual__c, npe01__SYSTEM_AccountType__c, Name
+                FROM Account a  WHERE Id IN :accountIds 
+                AND ( npe01__SYSTEM_AccountType__c = :ONE_TO_ONE_ORGANIZATION_TYPE
+                        OR ( npe01__SYSTEM_AccountType__c = :HH_ACCOUNT_TYPE AND npsp__Number_of_Household_Members__c = 1 )
+                )
+        ];
+    }
+
+    private List<SObject> getSObjectWithRecurringDonations(String sObjectType, Set<Id> recordIds, String status) {
+        // used in query as variable
+        Set<String> statusValues = this.getStatusValues(status);
+        Set<String> selectedField = new Set<String>{
+            SUSTAINER_FIELD,
+            this.getRecurringDonationSubQuery(sObjectType)
+        };
+        String queryString ='Select '+String.join((Iterable<String>)selectedField, ',')+' from '+sObjectType+' where Id in (\'' + String.join((Iterable<String>)recordIds, '\', \'')+'\')';
+        return Database.query(queryString);
+    }
+
+    private String getRecurringDonationSubQuery(String sObjectType) {
+        String lookupReference = sObjectType == 'Account'
+            ? 'npe03__RecurringDonations__r'
+            : 'npe03__R00N80000002bOmREAU__r';
+
+        return '(SELECT Id FROM ' + lookupReference +' WHERE npsp__Status__c IN: statusValues LIMIT 1)';
+    }
+
+    private List<SObject> evaluateCurrentSustainerTypeAndReturnNotMatchingRecords(SustainerType state, List<SObject> sustainerCandidates) {
+        List<SObject> needFurtherEvaluation = new List<SObject>();
+        String lookupReference = sustainerCandidates[0].getSObjectType() == Schema.Account.getSObjectType()
+            ? 'npe03__RecurringDonations__r'
+            : 'npe03__R00N80000002bOmREAU__r';
+        
+        for (Integer i = 0; i < sustainerCandidates.size(); i++) {
+            SObject candidate = sustainerCandidates[i];
+            List<npe03__Recurring_Donation__c> rdsWithSpecificState = candidate.getSobjects(lookupReference);
+
+            if (rdsWithSpecificState != null && rdsWithSpecificState.size() > 0) {
+                if (candidate.get(SUSTAINER_FIELD) != state.name()) {
+                    candidate.put(SUSTAINER_FIELD, state.name());
+                    this.recordsToUpdate.add(candidate);
+                }
+
+            } else {
+                needFurtherEvaluation.add(candidate);
+            }
+        }
+
+        return needFurtherEvaluation;
+    }
+
+    private Boolean  isPersonAccountsEnabled() {
+        Set<String> objectFields = Schema.SObjectType.Account.fields.getMap().keySet();
+        // note: objectFields contains all fields in lowercase
+        return objectFields.contains('isPersonAccount'.toLowerCase());
+    }
+
+    private Boolean canDo(DescribeFieldResult fieldResult, Allowed type) {
+        return (type === Allowed.canRead ? fieldResult.isAccessible(): fieldResult.isUpdateable());
+    }
+
+    private Set<Id> extractIds(List<SObject> records) {
+        if (records == null || records.isEmpty()) {
+            return new Set<Id>();
+        }
+        return new Map<Id, SObject>(records).keySet();
+    }
+
+    /**
+    * @description Evaluate what type of Donor the Account/Contact reocrd is. The Account/Contact records can be
+    * Active, Lapsed, or Former Sustainer.
+    * @param sObjectType The passed in record Ids' SObject type. The type can be either Account or Contact
+    * @param recordsIds A set of record Ids that will be evaluated
+    */
+    private List<SObject> evaulateSustainersFor(String sObjectType, Set<Id> recordIds) {
+        if (recordIds.isEmpty()) {
+            return new List<SObject>();
+        }
+    
+        List<SObject> evaulatedRecords = this.getSObjectWithRecurringDonations(sObjectType,  recordIds, STATUS_ACTIVE);
+        List<SObject> inactiveSustainers = this.evaluateCurrentSustainerTypeAndReturnNotMatchingRecords(SustainerType.Active, evaulatedRecords);
+
+        if (inactiveSustainers.size() == 0) {
+            return new List<SObject>();
+        }
+
+        List<SObject> lapsedSustainerCandidates = this.getSObjectWithRecurringDonations(sObjectType, this.extractIds(inactiveSustainers), STATUS_LAPSED);
+        List<SObject> formerSustainers = this.evaluateCurrentSustainerTypeAndReturnNotMatchingRecords(SustainerType.Lapsed, lapsedSustainerCandidates);
+
+        if (formerSustainers.size() == 0) {
+            return new List<SObject>();
+        }
+        List<SObject> formerSustainerCandidates = this.getSObjectWithRecurringDonations(sObjectType, this.extractIds(formerSustainers), STATUS_CLOSED);
+        List<SObject> nonSustainers = this.evaluateCurrentSustainerTypeAndReturnNotMatchingRecords(SustainerType.Former, formerSustainerCandidates);
+
+        for (SObject nonSustainer : nonSustainers) {
+            if (String.isNotBlank(String.valueOf(nonSustainer.get(SUSTAINER_FIELD)))) {
+                nonSustainer.put(SUSTAINER_FIELD, null);
+                this.recordsToUpdate.add(nonSustainer); 
+            }
+        }
+        return this.recordsToUpdate;
+    }
+
+    public List<Database.MergeResult> mergeContacts(Contact winningContact, List<Contact> losers) {
+        boolean successfulMerge = false;
+
+        List<Account> winnerAccount = new List<Account>();
+        Set<Id> loserAccountIds = new Set<Id>();
+        List<Account> loserAccounts = new List<Account>();
+        List<Account> loserAccountsToBeMerged = new List<Account>();
+            
+        Id winningAccountId = null;
+        Boolean winnerAccountIsOneToOne = false;
+        Id cId = winningContact.Id;
+        Contact winner = Database.query('SELECT ' + String.join(contactFields, ',') + ' FROM Contact WHERE Id = :cId');
+
+        // detect PersonAccounts
+        Boolean isPersonAccountsEnabled = this.isPersonAccountsEnabled();
+        // get winner contact Account
+        if (winner.AccountId!=null){
+            Id accId = winner.AccountId;
+            winnerAccount = Database.query('SELECT '+String.join(accountFields, ',')+' FROM Account WHERE Id = :accId');
+        }
+            
+        if (winnerAccount.size()>0) {
+            winningAccountId = winnerAccount[0].Id;
+            
+            if (winnerAccount[0].npe01__SYSTEM_AccountType__c== ONE_TO_ONE_ORGANIZATION_TYPE) {
+                winnerAccountIsOneToOne = true;
+            }
+            
+            if (isPersonAccountsEnabled && (ID)winnerAccount[0].get('PersonContactId') != null) {
+                throw new ConMergeException(conMergeErrNoPersonAccounts);
+            }
+        }
+
+        Set<Id> loserIds = new Map<Id, sObject>(new List<Contact>(losers)).keySet();
+        losers = Database.query('SELECT '+String.join((Iterable<String>)contactFields, ',')+' FROM Contact WHERE Id in (\'' + String.join((Iterable<String>)loserIds, '\', \'')+'\')');
+
+        for (Contact contactRecord : losers) {
+            if (isPersonAccountsEnabled && (boolean)contactRecord.get('isPersonAccount')){
+                throw new ConMergeException(conMergeErrNoPersonAccounts);
+            }
+                
+            //don't try to merge null Accounts or Accounts that are the same as the winner's Account
+            if (contactRecord.Id != null && contactRecord.AccountId != winner.AccountId) {
+                loserAccountIds.add(contactRecord.AccountId);
+            }
+        }
+                
+        // get loser contact Accounts that should be merged out.  This includes
+        // One2One accounts and Solo Household Accounts
+        loserAccountsToBeMerged = this.getHouseholdAndOrgAccountsFor(loserAccountIds);
+        // one-to-one contacts each have an Account, so when merging Contacts we have to merge Accounts as well
+        // we merge the Accounts first, if there are any one-to-one Accounts or Solo Household Accounts in the mix
+        if (loserAccountsToBeMerged.size() > 0) {
+            // IMPORTANT: here we need to resolve redundant relations before
+            List<Account> groupRecords = new List<Account>();
+            groupRecords.addAll(loserAccountsToBeMerged);
+            groupRecords.add( winnerAccount[0]);
+            Set<Id> accIds = this.extractIds(groupRecords);
+            // find all relations for group
+            List<AccountContactRelation> relations = Database.query('SELECT Id, AccountId, ContactId, IsDirect FROM AccountContactRelation where AccountId in (\'' + String.join((Iterable<String>)accIds, '\', \'')+'\')');
+            Map<Id, AccountContactRelation> relationsMap = new  Map<Id, AccountContactRelation>();
+            List<AccountContactRelation> relationsToBeDeleted = new List<AccountContactRelation> ();
+            // check for redundant contact relations and remove indirect
+            for (AccountContactRelation r: relations){
+                if (relationsMap.containsKey(r.ContactId)){
+                    AccountContactRelation dr = relationsMap.get(r.ContactId);
+                    if (dr.IsDirect) {
+                        // direct relation already in map 
+                        // because only one direct relation ca be assigned to Contact and it is already in map 
+                        // take indirect for delete
+                        relationsToBeDeleted.add(r); 
+                    } else {
+                        relationsToBeDeleted.add(dr); 
+                    }
+                } else {
+                    relationsMap.put(r.ContactId, r);
+                }
+            }
+            // delete indirect redundant relations
+            if (relationsToBeDeleted.size() > 0){
+                delete relationsToBeDeleted;
+            }
+            // can merge
+            merge winnerAccount[0] loserAccountsToBeMerged;
+            this.updateWinnerAccountSustainerAfterMerge(winnerAccount[0]);
+        }
+
+        // merge the contacts
+        
+        // there is a Contact delete trigger that deletes the one-to-one Account of a Contact after it is deleted
+        // merge deletes the losing Contacts, so their Accounts get deleted, which causes errors
+        // to get around this, we detach the Contacts for their Accounts before we merge
+        
+        // create new contacts for updating as the SOSL returned contacts have read-only fields on them
+        Contact winnerMakePrivate = new Contact();
+        if (winnerAccountIsOneToOne) {            
+            winnerMakePrivate = new Contact(Id = winner.id,AccountId = null, npe01__Private__c = true);
+        } else {
+            winnerMakePrivate = new Contact(Id = winner.id);
+        }
+        List<Contact> losersMakePrivate = new List<Contact>();
+        
+        for(Contact contactForUpdate : losers){
+            // only do this for One2One losers
+            if (contactForUpdate.Account.npe01__SYSTEM_AccountType__c == this.ONE_TO_ONE_ORGANIZATION_TYPE) {       
+                Contact loserMakePrivate = new Contact(id=contactForUpdate.id,accountId=null,npe01__Private__c=true);
+                losersMakePrivate.add(loserMakePrivate);
+            }
+        }
+            
+        // set the account to null and mark private so that trigger won't reset the Account
+        if (winningAccountId!=null && winnerAccountIsOneToOne) {
+            List<Contact> b = new List<Contact>();
+            b.add(winnerMakePrivate);
+            this.updateRecords(b);
+        }
+        
+        if (losersMakePrivate.size()>0) {
+            this.updateRecords(losersMakePrivate);
+        }
+        
+        // run salesforce merge
+        
+        // merge winnerMakePrivate losers;
+        List<Database.MergeResult> result = Database.merge(winnerMakePrivate, losers, false);
+
+        // set the contact Account Id back to the winning Account Id
+        if (winnerAccountIsOneToOne) {
+            winnerMakePrivate.AccountId = winningAccountId;
+            winnerMakePrivate.npe01__Private__c = false;
+            List<Contact> c = new List<Contact>();
+            c.add(winnerMakePrivate);
+            this.updateRecords(c);
+        }
+
+        return result;
+    }
+
+    private void updateWinnerAccountSustainerAfterMerge(Account winnerAccount) {
+        DescribeFieldResult sustainerFieldDescribeResult = Account.npsp__Sustainer__c.getDescribe();
+
+        Boolean canRead = this.canDo(sustainerFieldDescribeResult, Allowed.canRead);
+        Boolean canUpdate =  this.canDo(sustainerFieldDescribeResult, Allowed.canUpdate);
+        
+        if (canRead && canUpdate) {
+            List<Account> winnerWithSustainerChanged = this.evaulateSustainersFor('Account', new Map<Id, SObject>(new List<Account>{winnerAccount}).keySet());
+            if (winnerWithSustainerChanged.size() != 0) {
+                List<Database.SaveResult> updateResukts =  this.updateRecords(winnerWithSustainerChanged);
+            }
+        }
+    }
+
+    private List<Database.SaveResult> updateRecords(List<SObject> recordsToUpdate) {
+        Database.DMLOptions dmlOptions = new Database.DMLOptions();
+        dmlOptions.optAllOrNone = true;
+        // disable duplicates validation before save
+        dmlOptions.DuplicateRuleHeader.AllowSave = true; 
+        return Database.update(recordsToUpdate, dmlOptions);
+    }
+    
+    // inner classes 
+    class Mapping {
+        public String status;
+        public String label;
+        public String masterLabel;
+        public String developerName;
+        public String state;
+        public Boolean isReadOnly = false;
+
+        /**
+         * @description Constructor
+         * @param status Status picklist value
+         * @param label Status value label
+         */
+        public Mapping(String status, String label) {
+            this.status = status;
+            this.label = label;
+
+            if (READ_ONLY_STATUS_TO_STATE.containsKey(status)) {
+                this.state = READ_ONLY_STATUS_TO_STATE.get(status);
+                this.isReadOnly = true;
+            }
+        }
+
+        /**
+         * @description Populates configuration setting on the mapping record
+         * @param record Custom metadata type record containing mapping detail
+         * @return Mapping This mapping record instance
+         */
+        public Mapping withMappingRecord(npsp__RecurringDonationStatusMapping__mdt record) {
+            this.masterLabel = record.MasterLabel;
+            this.developerName = record.DeveloperName;
+            this.state = record.npsp__State__c;
+
+            return this;
+        }
+    }
+
+    class ConMergeException extends Exception {}
+}
