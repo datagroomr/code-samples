@@ -4,7 +4,7 @@ global class DG_Contact_Merger_NPSP {
 
     public final Integer MERGE_MINIMUM = 2;
     public final Integer MERGE_LIMIT = 3;
-    
+
     final String ONE_TO_ONE_ORGANIZATION_TYPE = 'One-to-One Individual';
     final String HH_ACCOUNT_TYPE = 'Household Account';
     final String INSUFFICIENT_PERMISSION_MESSAGE = 'You do not have permissions to modify';
@@ -252,12 +252,12 @@ global class DG_Contact_Merger_NPSP {
         // detect PersonAccounts
         Boolean isPersonAccountsEnabled = this.isPersonAccountsEnabled();
         // get winner contact Account
-        if (winner.AccountId!=null){
+        if (winner.AccountId != null) {
             Id accId = winner.AccountId;
             winnerAccount = Database.query('SELECT '+String.join(accountFields, ',')+' FROM Account WHERE Id = :accId');
         }
             
-        if (winnerAccount.size()>0) {
+        if (winnerAccount.size() > 0) {
             winningAccountId = winnerAccount[0].Id;
             
             if (winnerAccount[0].npe01__SYSTEM_AccountType__c== ONE_TO_ONE_ORGANIZATION_TYPE) {
@@ -273,7 +273,7 @@ global class DG_Contact_Merger_NPSP {
         losers = Database.query('SELECT '+String.join((Iterable<String>)contactFields, ',')+' FROM Contact WHERE Id in (\'' + String.join((Iterable<String>)loserIds, '\', \'')+'\')');
 
         for (Contact contactRecord : losers) {
-            if (isPersonAccountsEnabled && (boolean)contactRecord.get('isPersonAccount')){
+            if (isPersonAccountsEnabled && (boolean)contactRecord.get('isPersonAccount')) {
                 throw new ConMergeException(conMergeErrNoPersonAccounts);
             }
                 
@@ -286,9 +286,11 @@ global class DG_Contact_Merger_NPSP {
         // get loser contact Accounts that should be merged out.  This includes
         // One2One accounts and Solo Household Accounts
         loserAccountsToBeMerged = this.getHouseholdAndOrgAccountsFor(loserAccountIds);
+        System.debug(loserAccountsToBeMerged);
         // one-to-one contacts each have an Account, so when merging Contacts we have to merge Accounts as well
         // we merge the Accounts first, if there are any one-to-one Accounts or Solo Household Accounts in the mix
         if (loserAccountsToBeMerged.size() > 0) {
+            System.debug('Merge Accounts first with resolving redundant relations by contatcs if exists');
             // IMPORTANT: here we need to resolve redundant relations before
             List<Account> groupRecords = new List<Account>();
             groupRecords.addAll(loserAccountsToBeMerged);
@@ -299,7 +301,7 @@ global class DG_Contact_Merger_NPSP {
             Map<Id, AccountContactRelation> relationsMap = new  Map<Id, AccountContactRelation>();
             List<AccountContactRelation> relationsToBeDeleted = new List<AccountContactRelation> ();
             // check for redundant contact relations and remove indirect
-            for (AccountContactRelation r: relations){
+            for (AccountContactRelation r: relations) {
                 if (relationsMap.containsKey(r.ContactId)){
                     AccountContactRelation dr = relationsMap.get(r.ContactId);
                     if (dr.IsDirect) {
@@ -316,6 +318,7 @@ global class DG_Contact_Merger_NPSP {
             }
             // delete indirect redundant relations
             if (relationsToBeDeleted.size() > 0){
+                System.debug('Delete indirect redundant relations for accounts');
                 delete relationsToBeDeleted;
             }
             // can merge
@@ -329,12 +332,10 @@ global class DG_Contact_Merger_NPSP {
         // merge deletes the losing Contacts, so their Accounts get deleted, which causes errors
         // to get around this, we detach the Contacts for their Accounts before we merge
         
-        // create new contacts for updating as the SOSL returned contacts have read-only fields on them
-        Contact winnerMakePrivate = new Contact();
-        if (winnerAccountIsOneToOne) {            
-            winnerMakePrivate = new Contact(Id = winner.id,AccountId = null, npe01__Private__c = true);
-        } else {
-            winnerMakePrivate = new Contact(Id = winner.id);
+        Contact winnerMakePrivate = winningContact;
+        if (winnerAccountIsOneToOne) {        
+            winningContact.AccountId = null;    
+            winningContact.npe01__Private__c = true;
         }
         List<Contact> losersMakePrivate = new List<Contact>();
         
@@ -375,15 +376,23 @@ global class DG_Contact_Merger_NPSP {
     }
 
     private void updateWinnerAccountSustainerAfterMerge(Account winnerAccount) {
+        System.debug('updateWinnerAccountSustainerAfterMerge: ');
         DescribeFieldResult sustainerFieldDescribeResult = Account.npsp__Sustainer__c.getDescribe();
 
         Boolean canRead = this.canDo(sustainerFieldDescribeResult, Allowed.canRead);
-        Boolean canUpdate =  this.canDo(sustainerFieldDescribeResult, Allowed.canUpdate);
+        Boolean canUpdate = this.canDo(sustainerFieldDescribeResult, Allowed.canUpdate);
+
+        System.debug(String.valueOf(canRead));
+        System.debug(String.valueOf(canUpdate));
         
         if (canRead && canUpdate) {
+            System.debug('start : evaulateSustainersFor ');
             List<Account> winnerWithSustainerChanged = this.evaulateSustainersFor('Account', new Map<Id, SObject>(new List<Account>{winnerAccount}).keySet());
+            System.debug('finish : evaulateSustainersFor ');
+            System.debug( winnerWithSustainerChanged);
             if (winnerWithSustainerChanged.size() != 0) {
-                List<Database.SaveResult> updateResukts =  this.updateRecords(winnerWithSustainerChanged);
+                List<Database.SaveResult> updateResukts = this.updateRecords(winnerWithSustainerChanged);
+                System.debug(updateResukts);
             }
         }
     }
