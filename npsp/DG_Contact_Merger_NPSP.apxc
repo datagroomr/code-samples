@@ -233,8 +233,51 @@ global class DG_Contact_Merger_NPSP {
                 this.recordsToUpdate.add(nonSustainer); 
             }
         }
+
         return this.recordsToUpdate;
     }
+    
+    /*
+    // uncomment this method if "Contacts to Multiple Accounts" feature is enabled
+    // and redundant relations resolution is desired
+    private void resolveRedundantRelations( List<Account> loserAccountsToBeMerged, List<Account> winnerAccount) {
+        System.debug('Merge Accounts first with resolving redundant relations by contatcs if exists');
+
+        // IMPORTANT: here we need to resolve redundant relations before merge
+        List<Account> groupRecords = new List<Account>();
+        groupRecords.addAll(loserAccountsToBeMerged);
+        groupRecords.add(winnerAccount[0]);
+        Set<Id> accIds = this.extractIds(groupRecords);
+        
+        // find all relations in a group
+        List<AccountContactRelation> relations = Database.query('SELECT Id, AccountId, ContactId, IsDirect FROM AccountContactRelation where AccountId in (\'' + String.join((Iterable<String>)accIds, '\', \'')+'\')');
+        Map<Id, AccountContactRelation> relationsMap = new  Map<Id, AccountContactRelation>();
+        List<AccountContactRelation> relationsToBeDeleted = new List<AccountContactRelation> ();
+        
+        // check for redundant contact relations and remove indirect
+        for (AccountContactRelation r: relations) {
+            if (relationsMap.containsKey(r.ContactId)){
+                AccountContactRelation dr = relationsMap.get(r.ContactId);
+                if (dr.IsDirect) {
+                    // direct relation already in map 
+                    // because only one direct relation ca be assigned to Contact and it is already in map 
+                    // take indirect for delete
+                    relationsToBeDeleted.add(r); 
+                } else {
+                    relationsToBeDeleted.add(dr); 
+                }
+            } else {
+                relationsMap.put(r.ContactId, r);
+            }
+        }
+
+        // delete indirect redundant relations
+        if (relationsToBeDeleted.size() > 0){
+            System.debug('Delete indirect redundant relations for accounts');
+            delete relationsToBeDeleted;
+        }
+    }
+    */
 
     public List<Database.MergeResult> mergeContacts(Contact winningContact, List<Contact> losers) {
         boolean successfulMerge = false;
@@ -290,37 +333,10 @@ global class DG_Contact_Merger_NPSP {
         // one-to-one contacts each have an Account, so when merging Contacts we have to merge Accounts as well
         // we merge the Accounts first, if there are any one-to-one Accounts or Solo Household Accounts in the mix
         if (loserAccountsToBeMerged.size() > 0) {
-            System.debug('Merge Accounts first with resolving redundant relations by contatcs if exists');
-            // IMPORTANT: here we need to resolve redundant relations before
-            List<Account> groupRecords = new List<Account>();
-            groupRecords.addAll(loserAccountsToBeMerged);
-            groupRecords.add( winnerAccount[0]);
-            Set<Id> accIds = this.extractIds(groupRecords);
-            // find all relations for group
-            List<AccountContactRelation> relations = Database.query('SELECT Id, AccountId, ContactId, IsDirect FROM AccountContactRelation where AccountId in (\'' + String.join((Iterable<String>)accIds, '\', \'')+'\')');
-            Map<Id, AccountContactRelation> relationsMap = new  Map<Id, AccountContactRelation>();
-            List<AccountContactRelation> relationsToBeDeleted = new List<AccountContactRelation> ();
-            // check for redundant contact relations and remove indirect
-            for (AccountContactRelation r: relations) {
-                if (relationsMap.containsKey(r.ContactId)){
-                    AccountContactRelation dr = relationsMap.get(r.ContactId);
-                    if (dr.IsDirect) {
-                        // direct relation already in map 
-                        // because only one direct relation ca be assigned to Contact and it is already in map 
-                        // take indirect for delete
-                        relationsToBeDeleted.add(r); 
-                    } else {
-                        relationsToBeDeleted.add(dr); 
-                    }
-                } else {
-                    relationsMap.put(r.ContactId, r);
-                }
-            }
-            // delete indirect redundant relations
-            if (relationsToBeDeleted.size() > 0){
-                System.debug('Delete indirect redundant relations for accounts');
-                delete relationsToBeDeleted;
-            }
+            // uncomment the line below if "Contacts to Multiple Accounts" feature is enabled
+            // and redundant relations resolution is desired
+            // this.resolveRedundantRelations(loserAccountsToBeMerged, winnerAccount);
+            
             // can merge
             merge winnerAccount[0] loserAccountsToBeMerged;
             this.updateWinnerAccountSustainerAfterMerge(winnerAccount[0]);
